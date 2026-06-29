@@ -1,12 +1,12 @@
 "use client";
 
+import { useEffect, useState } from 'react';
 import { createClient } from '@supabase/supabase-js';
-import { useEffect, useState, useMemo } from 'react';
 
-// Initialize Supabase Connection
+// Initialize Real Supabase Connection (Ensure your .env.local is active)
 const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+  process.env.NEXT_PUBLIC_SUPABASE_URL || '',
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || ''
 );
 
 interface TradeRecord {
@@ -16,80 +16,70 @@ interface TradeRecord {
   broker_price: number | null;
   internal_volume: number | null;
   broker_volume: number | null;
+  price_delta: number | null;
+  volume_delta: number | null;
+  status: string;
 }
 
-export default function InteractiveDashboard() {
+export default function ServerSideDashboard() {
   const [trades, setTrades] = useState<TradeRecord[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [isQuerying, setIsQuerying] = useState(true);
   
-  // Interactive UI States
+  // UI Controls State
   const [priceTolerance, setPriceTolerance] = useState<number>(0.05);
   const [volumeTolerance, setVolumeTolerance] = useState<number>(0);
   const [statusFilter, setStatusFilter] = useState<string>("All");
 
-  // Fetch all trade pairs once on load
+  // Global Metrics State (Restoring our top counter cards)
+  const [metrics, setMetrics] = useState({ total: 0, perfect: 0, anomalies: 0 });
+
+  // SERVER-SIDE FETCHING ENGINE WITH DEBOUNCE
   useEffect(() => {
-    async function fetchTrades() {
-      const { data } = await supabase
-        .from('vw_reconciliation_results')
-        .select('matched_id, ticker, internal_price, broker_price, internal_volume, broker_volume');
+    const fetchFromDatabase = async () => {
+      setIsQuerying(true);
       
-      if (data) setTrades(data);
-      setLoading(false);
-    }
-    fetchTrades();
-  }, []);
+      try {
+        // 1. Fetch the filtered rows for the Data Table
+        const { data: rowData, error: rowError } = await supabase.rpc('get_dynamic_reconciliations', {
+          price_tol: priceTolerance,
+          vol_tol: volumeTolerance,
+          status_filter: statusFilter
+        });
 
-  // Live Engine Logic: Dynamically re-evaluate every trade based on slider values
-  const processedTrades = useMemo(() => {
-    return trades.map(trade => {
-      const pDiff = Math.abs((trade.internal_price || 0) - (trade.broker_price || 0));
-      const vDiff = Math.abs((trade.internal_volume || 0) - (trade.broker_volume || 0));
+        if (rowError) throw rowError;
+        setTrades(rowData || []);
 
-      let currentStatus = "Perfect Match";
-      
-      if (!trade.internal_price) {
-        currentStatus = "Missing in Internal";
-      } else if (!trade.broker_price) {
-        currentStatus = "Missing in Broker";
-      } else if (pDiff > priceTolerance) {
-        currentStatus = "Price Mismatch";
-      } else if (vDiff > volumeTolerance) {
-        currentStatus = "Volume Mismatch";
+        // 2. Fetch Global Metrics (Run RPC with 'All' to calculate totals regardless of current filter)
+        // In a real enterprise app, this would be a separate, highly-optimized SQL aggregate function
+        const { data: allData, error: metricError } = await supabase.rpc('get_dynamic_reconciliations', {
+          price_tol: priceTolerance,
+          vol_tol: volumeTolerance,
+          status_filter: 'All'
+        });
+
+        if (!metricError && allData) {
+          const total = allData.length;
+          const perfect = allData.filter((d: TradeRecord) => d.status === 'Perfect Match').length;
+          setMetrics({
+            total,
+            perfect,
+            anomalies: total - perfect
+          });
+        }
+      } catch (err) {
+        console.error("Database query failed:", err);
+      } finally {
+        setIsQuerying(false);
       }
+    };
 
-      return {
-        ...trade,
-        calculatedStatus: currentStatus,
-        priceDelta: pDiff,
-        volumeDelta: vDiff
-      };
-    });
-  }, [trades, priceTolerance, volumeTolerance]);
+    // Wait 300ms after the user stops moving the slider before querying the DB to prevent server overload
+    const timeoutId = setTimeout(() => {
+      fetchFromDatabase();
+    }, 300);
 
-  // Dynamic Metrics Analytics
-  const metrics = useMemo(() => {
-    const total = processedTrades.length;
-    const matched = processedTrades.filter(t => t.calculatedStatus === "Perfect Match").length;
-    const anomalies = total - matched;
-    
-    return { total, matched, anomalies };
-  }, [processedTrades]);
-
-  // Apply Status Dropdown Filter
-  const filteredTrades = useMemo(() => {
-    if (statusFilter === "All") return processedTrades;
-    if (statusFilter === "Anomalies") return processedTrades.filter(t => t.calculatedStatus !== "Perfect Match");
-    return processedTrades.filter(t => t.calculatedStatus === statusFilter);
-  }, [processedTrades, statusFilter]);
-
-  if (loading) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-gray-50 text-gray-500">
-        Loading institutional database pipelines...
-      </div>
-    );
-  }
+    return () => clearTimeout(timeoutId);
+  }, [priceTolerance, volumeTolerance, statusFilter]);
 
   return (
     <main className="min-h-screen bg-gray-50 p-6 md:p-12 font-sans text-gray-900">
@@ -99,10 +89,12 @@ export default function InteractiveDashboard() {
         <header className="border-b pb-4 flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
           <div>
             <h1 className="text-3xl font-light tracking-tight text-gray-900">Trade Reconciliation Command Center</h1>
-            <p className="text-gray-500 text-sm mt-1">Real-time cross-ledger matching engine & automated anomaly threshold controls.</p>
+            <p className="text-gray-500 text-sm mt-1">Server-Side SQL Processing via PostgreSQL RPC.</p>
           </div>
-          <span className="bg-emerald-50 text-emerald-700 text-xs font-medium px-2.5 py-1 rounded border border-emerald-200">
-            Engine Active
+          <span className={`px-3 py-1 rounded text-xs font-medium border transition-colors ${
+            isQuerying ? 'bg-amber-50 text-amber-700 border-amber-200' : 'bg-emerald-50 text-emerald-700 border-emerald-200'
+          }`}>
+            {isQuerying ? 'Executing SQL Query...' : 'Database Synchronized'}
           </span>
         </header>
 
@@ -114,7 +106,7 @@ export default function InteractiveDashboard() {
           </div>
           <div className="bg-white p-6 rounded-xl border border-gray-100 shadow-sm">
             <p className="text-xs font-semibold uppercase tracking-wider text-emerald-500">Perfect Matches</p>
-            <p className="text-3xl font-light mt-2 text-emerald-600">{metrics.matched}</p>
+            <p className="text-3xl font-light mt-2 text-emerald-600">{metrics.perfect}</p>
           </div>
           <div className="bg-white p-6 rounded-xl border border-gray-100 shadow-sm">
             <p className="text-xs font-semibold uppercase tracking-wider text-red-500">Flagged Anomalies</p>
@@ -154,56 +146,55 @@ export default function InteractiveDashboard() {
 
           {/* Dropdown Filter */}
           <div className="space-y-2">
-            <label className="text-xs font-medium text-gray-500">Filter View State</label>
+            <label className="text-xs font-medium text-gray-500">Database Filter Query</label>
             <select
               value={statusFilter}
               onChange={(e) => setStatusFilter(e.target.value)}
               className="w-full text-sm bg-gray-50 border border-gray-200 rounded-lg p-2 focus:outline-none focus:border-gray-900 transition-colors"
             >
-              <option value="All">All Evaluated Records</option>
-              <option value="Anomalies">All Flagged Anomalies</option>
-              <option value="Perfect Match">Perfect Matches Only</option>
-              <option value="Price Mismatch">Price Mismatches Only</option>
-              <option value="Volume Mismatch">Volume Mismatches Only</option>
-              <option value="Missing in Broker">Missing at Broker</option>
+              <option value="All">Fetch All Records</option>
+              <option value="Anomalies">Fetch Anomalies Only</option>
+              <option value="Perfect Match">Fetch Perfect Matches</option>
+              <option value="Price Mismatch">Fetch Price Mismatches</option>
+              <option value="Volume Mismatch">Fetch Volume Mismatches</option>
             </select>
           </div>
         </div>
 
         {/* Data Table */}
-        <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
-          <div className="overflow-x-auto">
+        <div className={`bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden transition-opacity duration-300 ${isQuerying ? 'opacity-50' : 'opacity-100'}`}>
+          <div className="overflow-x-auto h-[600px] overflow-y-auto relative">
             <table className="w-full text-left text-sm whitespace-nowrap">
-              <thead className="bg-gray-50 text-gray-500 border-b uppercase text-[10px] tracking-wider">
+              <thead className="bg-gray-50 text-gray-500 border-b uppercase text-[10px] tracking-wider sticky top-0 shadow-sm">
                 <tr>
                   <th className="p-4 font-semibold">Trade ID</th>
                   <th className="p-4 font-semibold">Ticker</th>
-                  <th className="p-4 font-semibold text-right">Internal (Ledger / Vol)</th>
-                  <th className="p-4 font-semibold text-right">External (Broker / Vol)</th>
-                  <th className="p-4 font-semibold text-center">Status</th>
+                  <th className="p-4 font-semibold text-right">Internal Ledger</th>
+                  <th className="p-4 font-semibold text-right">External Broker</th>
+                  <th className="p-4 font-semibold text-center">Engine Status</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-50">
-                {filteredTrades.length === 0 ? (
+                {trades.length === 0 ? (
                   <tr>
                     <td colSpan={5} className="p-8 text-center text-gray-400 text-sm">
-                      No matching records found within current threshold parameters.
+                      Database returned 0 rows for the current query parameters.
                     </td>
                   </tr>
                 ) : (
-                  filteredTrades.map((row) => {
-                    const isPerfect = row.calculatedStatus === "Perfect Match";
+                  trades.map((row) => {
+                    const isPerfect = row.status === "Perfect Match";
                     return (
                       <tr key={row.matched_id} className="hover:bg-gray-50/70 transition-colors">
                         <td className="p-4 font-mono text-xs text-gray-500">{row.matched_id}</td>
                         <td className="p-4 font-medium text-gray-900">{row.ticker}</td>
                         <td className="p-4 text-right">
                           <span className="font-medium">${row.internal_price?.toFixed(2) || '---'}</span>
-                          <span className="text-xs text-gray-400 block">{row.internal_volume || '---'} units</span>
+                          <span className="text-xs text-gray-400 block">{row.internal_volume || '---'} vol</span>
                         </td>
                         <td className="p-4 text-right">
                           <span className="font-medium">${row.broker_price?.toFixed(2) || '---'}</span>
-                          <span className="text-xs text-gray-400 block">{row.broker_volume || '---'} units</span>
+                          <span className="text-xs text-gray-400 block">{row.broker_volume || '---'} vol</span>
                         </td>
                         <td className="p-4 text-center">
                           <span className={`inline-block px-2.5 py-1 rounded text-xs font-medium border ${
@@ -211,7 +202,7 @@ export default function InteractiveDashboard() {
                               ? 'bg-emerald-50 text-emerald-700 border-emerald-100' 
                               : 'bg-red-50 text-red-700 border-red-100'
                           }`}>
-                            {row.calculatedStatus}
+                            {row.status}
                           </span>
                         </td>
                       </tr>
