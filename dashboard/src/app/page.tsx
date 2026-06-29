@@ -49,21 +49,18 @@ export default function ServerSideDashboard() {
         if (rowError) throw rowError;
         setTrades(rowData || []);
 
-        // 2. Fetch Global Metrics (Run RPC with 'All' to calculate totals regardless of current filter)
-        // In a real enterprise app, this would be a separate, highly-optimized SQL aggregate function
-        const { data: allData, error: metricError } = await supabase.rpc('get_dynamic_reconciliations', {
+        // 2. Fetch Global Metrics (Aggregate directly in the database to prevent over-fetching and network overhead)
+        const { data: metricData, error: metricError } = await supabase.rpc('get_reconciliation_summary_metrics', {
           price_tol: priceTolerance,
-          vol_tol: volumeTolerance,
-          status_filter: 'All'
+          vol_tol: volumeTolerance
         });
 
-        if (!metricError && allData) {
-          const total = allData.length;
-          const perfect = allData.filter((d: TradeRecord) => d.status === 'Perfect Match').length;
+        if (!metricError && metricData && metricData.length > 0) {
+          const summary = metricData[0];
           setMetrics({
-            total,
-            perfect,
-            anomalies: total - perfect
+            total: Number(summary.total_count),
+            perfect: Number(summary.perfect_count),
+            anomalies: Number(summary.anomaly_count)
           });
         }
       } catch (err) {
