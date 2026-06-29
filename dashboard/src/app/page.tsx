@@ -1,13 +1,7 @@
 "use client";
 
 import { useEffect, useState } from 'react';
-import { createClient } from '@supabase/supabase-js';
-
-// Initialize Real Supabase Connection (Ensure your .env.local is active)
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL || '',
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || ''
-);
+import { decryptPayload } from './utils/crypto';
 
 interface TradeRecord {
   matched_id: string;
@@ -39,29 +33,28 @@ export default function ServerSideDashboard() {
       setIsQuerying(true);
       
       try {
-        // 1. Fetch the filtered rows for the Data Table
-        const { data: rowData, error: rowError } = await supabase.rpc('get_dynamic_reconciliations', {
-          price_tol: priceTolerance,
-          vol_tol: volumeTolerance,
-          status_filter: statusFilter
+        const response = await fetch('/api/reconciliations', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            priceTolerance,
+            volumeTolerance,
+            statusFilter,
+          }),
         });
 
-        if (rowError) throw rowError;
-        setTrades(rowData || []);
+        if (!response.ok) {
+          throw new Error(`API error: ${response.statusText}`);
+        }
 
-        // 2. Fetch Global Metrics (Aggregate directly in the database to prevent over-fetching and network overhead)
-        const { data: metricData, error: metricError } = await supabase.rpc('get_reconciliation_summary_metrics', {
-          price_tol: priceTolerance,
-          vol_tol: volumeTolerance
-        });
-
-        if (!metricError && metricData && metricData.length > 0) {
-          const summary = metricData[0];
-          setMetrics({
-            total: Number(summary.total_count),
-            perfect: Number(summary.perfect_count),
-            anomalies: Number(summary.anomaly_count)
-          });
+        const data = await response.json();
+        if (data.payload) {
+          // Decrypt the AES-GCM encrypted payload
+          const decrypted = await decryptPayload(data.payload);
+          setTrades(decrypted.trades || []);
+          setMetrics(decrypted.metrics || { total: 0, perfect: 0, anomalies: 0 });
         }
       } catch (err) {
         console.error("Database query failed:", err);
