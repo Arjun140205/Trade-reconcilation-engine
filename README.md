@@ -104,31 +104,35 @@ failure patterns in financial operations literature, not arbitrary.
 ```mermaid
 erDiagram
     internal_trades {
-        varchar trade_id PK
-        varchar ticker
-        varchar trade_type
-        integer volume
-        numeric price
-        timestamp execution_time
+        varchar trade_id PK "Primary Key"
+        varchar ticker "Ticker symbol (e.g., AAPL)"
+        varchar trade_type "BUY or SELL"
+        integer volume "Quantity of shares"
+        numeric price "Execution Price"
+        timestamp execution_time "Timestamp of internal record"
     }
+
     broker_trades {
-        varchar broker_trade_id PK
-        varchar ticker
-        varchar trade_type
-        integer volume
-        numeric price
-        timestamp execution_time
+        varchar broker_trade_id PK "Primary Key"
+        varchar ticker "Ticker symbol (e.g., AAPL)"
+        varchar trade_type "BUY or SELL"
+        integer volume "Quantity of shares"
+        numeric price "Settlement Price"
+        timestamp execution_time "Timestamp of broker record"
     }
+
     vw_reconciliation_results {
-        varchar matched_id
-        numeric internal_price
-        numeric broker_price
-        integer internal_volume
-        integer broker_volume
-        varchar reconciliation_status
+        varchar matched_id "COALESCE(trade_id, broker_trade_id)"
+        varchar ticker "COALESCE(ticker, ticker)"
+        numeric internal_price "Sourced from internal ledger"
+        numeric broker_price "Sourced from broker log"
+        integer internal_volume "Sourced from internal ledger"
+        integer broker_volume "Sourced from broker log"
+        varchar status "Calculated Error State"
     }
-    internal_trades ||--o| vw_reconciliation_results : "Left side"
-    broker_trades ||--o| vw_reconciliation_results : "Right side"
+
+    internal_trades ||--o| vw_reconciliation_results : "Left side feed"
+    broker_trades ||--o| vw_reconciliation_results : "Right side feed"
 ```
 
 ---
