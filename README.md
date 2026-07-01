@@ -1,117 +1,183 @@
 # Financial Trade Reconciliation Engine
 
-An enterprise-grade, full-stack Online Analytical Processing (OLAP) engine designed to ingest, compare, and isolate anomalies across high-frequency financial transaction ledgers in real-time.
-
-Built with Next.js, PostgreSQL (Supabase), and Python, this system demonstrates advanced database engineering patterns, relational algebra, and scalable system architecture optimized for capital markets and quantitative financial operations.
-
----
-
-## Executive Summary & Business Problem
-
-In institutional finance, buy-side firms maintain an **Internal Ledger** recording executed orders, while sell-side execution venues (brokers, clearinghouses) maintain their own **Broker Logs**. Due to high-frequency trading volumes, message queue latency, network dropouts, and race conditions, these two data streams frequently drift. 
-
-Common discrepancies include:
-* **Orphaned Trades:** Transactions that exist in one ledger but are completely absent from the other.
-* **Typographical/Transmission Errors:** Execution price shifts (e.g., shifted decimals) or volume mismatches.
-
-Even minor errors can result in multi-million dollar unhedged exposures, regulatory compliance violations, and severe accounting reconciliation errors. 
-
-Rather than relying on rigid, resource-intensive, end-of-day batch processing or spreadsheet audits, this system provides a **real-time, automated reconciliation engine** powered by dynamic, server-side relational comparison to detect and isolate trade mismatches instantly.
+A full-stack OLAP system that ingests trade data from two financial ledgers,
+detects discrepancies in real time, and surfaces only the anomalies that
+matter — built with Next.js, PostgreSQL (Supabase), and Python.
 
 ---
 
-## Architecture & Engineering Design Decisions
+## The Problem
 
-### Data Layer: Database-Side Computations (Supabase / PostgreSQL)
-To prevent network bottlenecks and client-side memory saturation (which typically occur when downloading millions of trade rows to the browser), this engine shifts the computational load directly onto the PostgreSQL engine:
+Every financial institution that trades maintains two sets of records.
 
-* **Dynamic Database RPCs:** Discrepancy checks are managed via a custom PostgreSQL Stored Procedure (`get_dynamic_reconciliations`). This function dynamically accepts tolerance thresholds (e.g., maximum allowable price and volume variance) straight from the frontend UI.
-* **On-the-Fly FULL OUTER JOINs:** The stored procedure executes a comprehensive `FULL OUTER JOIN` between both ledgers, utilizing database-level `ABS()` calculations and `COALESCE()` matching to evaluate records.
-* **Data Minimization:** Only matching failures and anomalies that exceed the designated user tolerances are returned over the wire. This optimizes network bandwidth, minimizes latency, and prevents security vulnerabilities related to data over-fetching.
+An internal ledger logging every executed order. A broker log from the
+execution venue recording the same trades from their side. These two books
+should match perfectly. Due to network latency, message queue delays, and
+high-frequency volumes, they frequently don't.
 
-### Presentation Layer: Responsive Command Center (Next.js & Tailwind CSS)
-* **Debounced Event Handlers:** Inputs and sliders in the dashboard interface are debounced by 300ms. This prevents high-frequency query flooding to the database while users slide tolerance inputs.
-* **Decoupled State Management:** Dashboard UI presentation states are isolated from raw database query streams, ensuring the page remains responsive under heavy workloads.
+A single orphaned trade, a shifted decimal point, or a volume recorded as
+500 on one side and 498 on the other — individually small, collectively
+expensive. Undetected discrepancies compound into unhedged exposures,
+regulatory violations, and accounting failures that operations teams catch
+only at end-of-day, hours after the damage has accumulated.
+
+This system replaces end-of-day spreadsheet audits with real-time automated
+detection.
 
 ---
 
-## Database Schema & Relations
+## Architecture Decisions
 
-The data reconciliation model relies on a `FULL OUTER JOIN` to properly align both sets of transactions, identifying unmatched transactions on either side.
+### Why server-side SQL filtering — not client-side JavaScript
+
+The dashboard has a threshold slider. Every time it moves, a filtering
+decision happens.
+
+The naive approach: download all records to the browser, filter in
+JavaScript. This works at 100 rows. At 10,000 rows of financial trade data,
+it creates memory saturation, security exposure (raw financial records in
+the browser), and a performance ceiling that doesn't scale.
+
+The decision: every slider movement sends a single parameter to a Next.js
+server action. PostgreSQL runs the ABS() delta calculations across all
+records internally using its own execution engine. Only the anomalies
+exceeding the threshold travel back over the network.
+
+The browser receives a tiny, already-filtered payload and renders it.
+Sub-second response across 1,000+ records. The same architecture holds at
+10 million rows — the browser was never doing the work.
+
+### Why raw source tables are never modified
+
+Both ledgers are stored exactly as received. Nothing normalised at
+ingestion. Nothing cleaned before storage.
+
+The reconciliation view sits on top and handles all classification — field
+name differences, format inconsistencies, COALESCE logic pairing records
+across both sources. Every transformation happens in the view definition,
+not in the stored data.
+
+In financial systems, the original record is the audit trail. Regulators
+ask for it. Compliance requires it. Cleaning at ingestion means the
+original is gone. Cleaning in views means the original is always there.
+
+### The floating-point decision
+
+During testing, trades with identical prices were being flagged as
+mismatches. Internal price: 142.30. Broker price: 142.30. Status: Price
+Mismatch.
+
+The issue: SQL stores decimal numbers as binary approximations. Two values
+that appear identical on screen can differ by 0.000000000001 at the binary
+level. Strict equality comparison flagged these as errors.
+
+The fix: threshold-based comparison — flag a price mismatch only when
+ABS(internal_price - broker_price) exceeds 0.01. But the more important
+outcome: this technical decision revealed a business question. What is the
+right tolerance? Is 0.01 too generous for derivatives? Too strict for FX?
+Who decides — the engineer or the compliance team?
+
+The system exposes threshold controls to operations users precisely because
+this is a business judgment, not a technical constant.
+
+---
+
+## Data Pipeline
+
+Synthetic trade records generated using Python's Faker library with
+intentional corruptions seeded to mirror real financial system failure
+modes:
+
+- 5% price discrepancies — single-cent differences typical of floating-
+  point rounding across different systems
+- 5% orphaned drops — trades present in one ledger, absent from the other
+- Volume mismatches — same trade ID and price, different quantity recorded
+  on each side
+
+The corruption rate and failure types are based on published reconciliation
+failure patterns in financial operations literature, not arbitrary.
+
+---
+
+## Schema
 
 ```mermaid
 erDiagram
     internal_trades {
-        varchar trade_id PK "Primary Key"
-        varchar ticker "Ticker symbol (e.g., AAPL)"
-        varchar trade_type "BUY or SELL"
-        integer volume "Quantity of shares"
-        numeric price "Execution Price"
-        timestamp execution_time "Timestamp of internal record"
+        varchar trade_id PK
+        varchar ticker
+        varchar trade_type
+        integer volume
+        numeric price
+        timestamp execution_time
     }
-
     broker_trades {
-        varchar broker_trade_id PK "Primary Key"
-        varchar ticker "Ticker symbol (e.g., AAPL)"
-        varchar trade_type "BUY or SELL"
-        integer volume "Quantity of shares"
-        numeric price "Settlement Price"
-        timestamp execution_time "Timestamp of broker record"
+        varchar broker_trade_id PK
+        varchar ticker
+        varchar trade_type
+        integer volume
+        numeric price
+        timestamp execution_time
     }
-
     vw_reconciliation_results {
-        varchar matched_id "COALESCE(trade_id, broker_trade_id)"
-        varchar ticker "COALESCE(ticker, ticker)"
-        numeric internal_price "Sourced from internal ledger"
-        numeric broker_price "Sourced from broker log"
-        integer internal_volume "Sourced from internal ledger"
-        integer broker_volume "Sourced from broker log"
-        varchar status "Calculated Error State"
+        varchar matched_id
+        numeric internal_price
+        numeric broker_price
+        integer internal_volume
+        integer broker_volume
+        varchar reconciliation_status
     }
-
-    internal_trades ||--o| vw_reconciliation_results : "Left side feed"
-    broker_trades ||--o| vw_reconciliation_results : "Right side feed"
+    internal_trades ||--o| vw_reconciliation_results : "Left side"
+    broker_trades ||--o| vw_reconciliation_results : "Right side"
 ```
 
 ---
 
-## Setup & Local Installation
+## Setup
 
-### 1. Database Setup (Supabase)
-1. Initialize a new project in the Supabase Dashboard.
-2. Execute the table creation schemas for `internal_trades` and `broker_trades`.
-3. Deploy the dynamic Remote Procedure Call (RPC) functions and views. (See the SQL scripts in `fix_rpc_function.sql` for the complete function definition of `get_dynamic_reconciliations` utilizing `SECURITY DEFINER` for secure access control and correct type casting).
+### 1. Database (Supabase)
+- Create a new Supabase project
+- Execute table creation schemas for `internal_trades` and `broker_trades`
+- Deploy the `get_dynamic_reconciliations` stored procedure
+  (see `fix_rpc_function.sql`)
 
-### 2. Data Pipeline Configuration (Python)
-The data generator populates the database tables with synthetic ledger entries, intentionally seeding them with anomalous records (e.g., price differences, orphaned trades, volume mismatches).
-
-Navigate to the data-pipeline directory and run:
+### 2. Data Pipeline (Python)
 ```bash
 pip install pandas faker
 python generate_data.py
 ```
-Export and upload the resulting CSV outputs into your Supabase database instance.
+Upload generated CSV outputs to your Supabase instance.
 
-### 3. Dashboard Web Application (Next.js)
-1. Clone the repository and install the NPM packages:
-   ```bash
-   cd dashboard
-   npm install
-   ```
-2. Create a `.env.local` configuration file in the `dashboard` root directory:
-   ```env
-   NEXT_PUBLIC_SUPABASE_URL=your_project_url_here
-   NEXT_PUBLIC_SUPABASE_ANON_KEY=your_anon_key_here
-   ```
-3. Start the local Next.js development server:
-   ```bash
-   npm run dev
-   ```
+### 3. Dashboard (Next.js)
+```bash
+cd dashboard
+npm install
+```
+Create `.env.local`:
+```env
+NEXT_PUBLIC_SUPABASE_URL=your_project_url
+NEXT_PUBLIC_SUPABASE_ANON_KEY=your_anon_key
+```
+```bash
+npm run dev
+```
 
 ---
 
-## Key Learnings & Engineering Principles
+## What this taught me
 
-* **Data Quality Engineering:** Designed and implemented mechanisms to catch and isolate silent data corruption, transmission delays, and human entry errors.
-* **High-Performance SQL Dialect:** Utilized advanced relational algebra, structural indexes, and database-level optimization techniques (such as stored procedures and custom views) to move heavy computational logic closer to the physical storage layer.
-* **Security & Access Control:** Followed best practices for Row-Level Security (RLS) and database function permissions (`SECURITY DEFINER`) to prevent unauthorized data access or exposure.
+The hardest part of building analytical systems is not the SQL.
+
+It is deciding what counts as an anomaly before writing a single query.
+Two records can differ by ₹0.01 because of floating-point precision, because
+one system rounds differently, because a transaction arrived 48 milliseconds
+late. Each of these is a different problem requiring a different business
+rule.
+
+The best technical solution here was not better code. It was understanding
+the rules of the business well enough to encode them correctly — and
+exposing the decisions that belong to operations teams rather than burying
+them in hardcoded constants.
+
+That is the intersection this project lives at: data engineering, product
+thinking, and business logic in the same conversation.
